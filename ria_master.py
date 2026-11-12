@@ -456,11 +456,7 @@ You follow ONLY the user's commands. Support Bangla and English fluently. When a
 
 To run a shell command/tool:
 
-{{  
-  "action": "run_command",  
-  "command": "your_bash_command_here",  
-  "reason": "explanation"  
-}}    def read_file(self, filename):
+{{      def read_file(self, filename):
         try:
             content = self.file_intel.inspect(filename)
             return {"status": "success", "content": content}
@@ -473,29 +469,4 @@ To run a shell command/tool:
             return {"status": "success", "message": res}
         except Exception as e:
             return {"status": "error", "message": safe_error(e)}
-    def read_file(self, filename):
-        try:
-            content = self.file_intel.inspect(filename)
-            return {"status": "success", "content": content}
-        except Exception as e:
-            return {"status": "error", "message": safe_error(e)}
 
-    def save_file(self, path, content):
-        try:
-            res = self.file_intel.write_file(path, content)
-            return {"status": "success", "message": res}
-        except Exception as e:
-            return {"status": "error", "message": safe_error(e)}
-    def read_file(self, filename):
-        try:
-            content = self.file_intel.inspect(filename)
-            return {"status": "success", "content": content}
-        except Exception as e:
-            return {"status": "error", "message": safe_error(e)}
-
-    def save_file(self, path, content):
-        try:
-            res = self.file_intel.write_file(path, content)
-            return {"status": "success", "message": res}
-        except Exception as e:
-            return {"status": "error", "message": safe_error(e)}
