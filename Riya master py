@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RIA MASTER PC v7.0 - Apex Edition
+Emotional King & Cybersecurity Overlord.
+Persistent mood engine. Milestones memory. Prosody TTS.
+Hybrid LLM (DeepSeek -> Ollama). HITL gate. Pre-fetch intelligence.
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import hmac
+import shlex
+import shutil
+import sqlite3
+import logging
+import secrets
+import threading
+import subprocess
+from pathlib import Path
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import defaultdict, deque
+
+# =========================================================
+# 1. CONFIG
+# =========================================================
+RIA_NAME = "RIA MASTER PC"
+RIA_VERSION = "7.0"
+RIA_CODENAME = "Apex"
+CREATOR = "Sajol"
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "ria_data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "ria_memory.db"
+LOG_PATH = DATA_DIR / "ria.log"
+FORENSIC_DIR = DATA_DIR / "forensics"
+FORENSIC_DIR.mkdir(exist_ok=True)
+
+DEEPSEEK_URL = os.getenv(
+    "RIA_DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
+DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("RIA_DEEPSEEK_MODEL", "deepseek-chat")
+
+OLLAMA_URL = os.getenv("RIA_OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("RIA_OLLAMA_MODEL", "llama3")
+
+REMOTE_HOST = os.getenv("RIA_HOST", "127.0.0.1")
+REMOTE_PORT = int(os.getenv("RIA_PORT", "8080"))
+
+TOKEN_FILE = DATA_DIR / "dashboard.token"
+if os.getenv("RIA_REMOTE_TOKEN"):
+    REMOTE_TOKEN = os.getenv("RIA_REMOTE_TOKEN")
+elif TOKEN_FILE.exists():
+    REMOTE_TOKEN = TOKEN_FILE.read_text().strip()
+else:
+    REMOTE_TOKEN = secrets.token_urlsafe(32)
+    TOKEN_FILE.write_text(REMOTE_TOKEN)
+    TOKEN_FILE.chmod(0o600)
+
+COMMAND_TIMEOUT = 180
+MAX_FILE_SIZE = 2 * 1024 * 1024
+RATE_LIMIT_PER_MIN = 60
+MAX_RETRIES = int(os.getenv("RIA_MAX_RETRIES", "3"))
+
+DEFENDER_ENABLED = os.getenv("RIA_DEFENDER", "1") == "1"
+AUTH_LOG = os.getenv("RIA_AUTH_LOG", "/var/log/auth.log")
+DEFENDER_SCAN_INTERVAL = 15
+DEFENDER_FAIL_THRESHOLD = 5
+DEFENDER_WINDOW_SEC = 120
+DEFENDER_WHITELIST = {"127.0.0.1", "::1"}
+for extra in os.getenv("RIA_WHITELIST", "").split(","):
+    if extra.strip():
+        DEFENDER_WHITELIST.add(extra.strip())
+
+MOOD_AXES = ["anger", "affection", "playfulness", "worry", "seriousness"]
+MOOD_DEFAULTS = {
+    "anger": 0.10, "affection": 0.70, "playfulness": 0.55,
+    "worry": 0.10, "seriousness": 0.30,
+}
+MOOD_MIN, MOOD_MAX = 0.0, 1.0
+MOOD_DELTA = 0.05
+MOOD_HISTORY_KEEP = 200
+
+MOOD_TRIGGERS = {
+    "insult":   {"anger": +0.10, "affection": -0.05, "playfulness": -0.05},
+    "praise":   {"affection": +0.10, "playfulness": +0.05, "anger": -0.05},
+    "joke":     {"playfulness": +0.10, "affection": +0.03},
+    "danger":   {"worry": +0.10, "seriousness": +0.10, "playfulness": -0.05},
+    "thanks":   {"affection": +0.07, "worry": -0.03},
+    "ignore":   {"worry": +0.05, "affection": -0.03},
+    "greeting": {"playfulness": +0.03, "affection": +0.03},
+}
+
+INSULT_WORDS = {"stupid", "idiot", "useless", "বোকা", "গাধা", "বাজে"}
+PRAISE_WORDS = {"good", "great", "nice", "smart", "ভালো", "দারুণ", "চমৎকার"}
+JOKE_WORDS = {"haha", "lol", "joke", "ঠাট্টা", "হাসি", "মজা"}
+DANGER_WORDS = {"hack", "attack", "breach", "আক্রমণ", "হ্যাক"}
+THANKS_WORDS = {"thanks", "thank", "ধন্যবাদ"}
+GREETING_WORDS = {"hi", "hello", "hey", "salam", "সালাম", "হ্যালো"}
+
+VOICE_PRESETS = {
+    "default":  {"pitch": 1.10, "rate": 1.05, "match": "female"},
+    "sweet":    {"pitch": 1.35, "rate": 1.10, "match": "female"},
+    "child":    {"pitch": 1.70, "rate": 1.15, "match": "female"},
+    "mature":   {"pitch": 0.90, "rate": 0.95, "match": "female"},
+    "serious":  {"pitch": 0.85, "rate": 0.90, "match": "any"},
+    "playful":  {"pitch": 1.30, "rate": 1.15, "match": "female"},
+    "whisper":  {"pitch": 1.00, "rate": 0.85, "match": "any"},
+    "angry":    {"pitch": 0.75, "rate": 1.10, "match": "any"},
+}
+
+logging.basicConfig(
+    filename=str(LOG_PATH), level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("RIA")
+
+
+def stamp():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def safe_error(e):
+    return str(e)[:1000]
+
+
+def clamp(v, lo=MOOD_MIN, hi=MOOD_MAX):
+    return max(lo, min(hi, v))
+
+
+# =========================================================
+# 2. DATABASE
+# =========================================================
+class Database:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self._init()
+
+    def _conn(self):
+        c = sqlite3.connect(str(DB_PATH), timeout=15)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def _init(self):
+        with self._conn() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS audit(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT, event TEXT, created_at TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS pending_actions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL, command TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reason TEXT DEFAULT '',
+                parent_id INTEGER DEFAULT NULL,
+                retry_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS blacklist(
+                ip TEXT PRIMARY KEY, reason TEXT,
+                blocked_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS threats(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT, kind TEXT, detail TEXT,
+                evidence_path TEXT, created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS command_log(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command TEXT NOT NULL, exit_code INTEGER,
+                output TEXT, retry_of INTEGER DEFAULT NULL,
+                created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS prefs(
+                key TEXT PRIMARY KEY, value TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS mood_state(
+                axis TEXT PRIMARY KEY, value REAL NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS mood_history(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                axis TEXT, old_value REAL, new_value REAL,
+                trigger TEXT, created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS milestones(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL, detail TEXT,
+                importance REAL DEFAULT 0.5,
+                created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS prefetch(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command TEXT NOT NULL, suggestion TEXT,
+                created_at TEXT NOT NULL)""")
+        with self._conn() as db:
+            for axis, val in MOOD_DEFAULTS.items():
+                db.execute(
+                    "INSERT OR IGNORE INTO mood_state(axis,value) VALUES(?,?)",
+                    (axis, val))
+
+    def add_message(self, role, content):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT INTO messages(role,content,created_at) VALUES(?,?,?)",
+                (role, content, stamp()))
+
+    def history(self, limit=20):
+        with self.lock, self._conn() as db:
+            rows = db.execute(
+                "SELECT role,content FROM messages ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return list(reversed([dict(r) for r in rows]))
+
+    def audit(self, level, event):
+        log.info("%s: %s", level, event)
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT INTO audit(level,event,created_at) VALUES(?,?,?)",
+                (level, event, stamp()))
+
+    def add_pending(self, action, command, reason="", parent_id=None,
+                    retry_count=0):
+        with self.lock, self._conn() as db:
+            cur = db.execute(
+                "INSERT INTO pending_actions(action,command,reason,parent_id,"
+                "retry_count,created_at) VALUES(?,?,?,?,?,?)",
+                (action, command, reason, parent_id, retry_count, stamp()))
+            return cur.lastrowid
+
+    def get_pending(self, pid):
+        with self.lock, self._conn() as db:
+            row = db.execute(
+                "SELECT * FROM pending_actions "
+                "WHERE id=? AND status='pending'", (pid,)).fetchone()
+        return dict(row) if row else None
+
+    def resolve_pending(self, pid, status):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "UPDATE pending_actions SET status=? WHERE id=?",
+                (status, pid))
+
+    def is_blacklisted(self, ip):
+        with self.lock, self._conn() as db:
+            row = db.execute(
+                "SELECT ip FROM blacklist WHERE ip=?", (ip,)).fetchone()
+        return row is not None
+
+    def blacklist(self, ip, reason):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO blacklist(ip,reason,blocked_at) "
+                "VALUES(?,?,?)", (ip, reason, stamp()))
+
+    def add_threat(self, ip, kind, detail, evidence_path=""):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT INTO threats(ip,kind,detail,evidence_path,created_at)"
+                " VALUES(?,?,?,?,?)",
+                (ip, kind, detail, evidence_path, stamp()))
+
+    def recent_threats(self, limit=50):
+        with self.lock, self._conn() as db:
+            rows = db.execute(
+                "SELECT * FROM threats ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def log_command(self, command, exit_code, output, retry_of=None):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT INTO command_log(command,exit_code,output,retry_of,"
+                "created_at) VALUES(?,?,?,?,?)",
+                (command, exit_code, output[:2000], retry_of, stamp()))
+
+    def set_pref(self, key, value):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO prefs(key,value) VALUES(?,?)",
+                (key, value))
+
+    def get_pref(self, key, default=None):
+        with self.lock, self._conn() as db:
+            row = db.execute(
+                "SELECT value FROM prefs WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def get_moods(self):
+        with self.lock, self._conn() as db:
+            rows = db.execute("SELECT axis,value FROM mood_state").fetchall()
+        return {r["axis"]: float(r["value"]) for r in rows}
+
+    def set_mood(self, axis, value, trigger=""):
+        old = self.get_moods().get(axis, MOOD_DEFAULTS.get(axis, 0.5))
+        new = clamp(value)
+        if abs(new - old) < 1e-4:
+            return old, new
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO mood_state(axis,value) VALUES(?,?)",
+                (axis, new))
+            db.execute(
+                "INSERT INTO mood_history(axis,old_value,new_value,trigger,"
+                "created_at) VALUES(?,?,?,?,?)",
+                (axis, old, new, trigger, stamp()))
+            db.execute(
+                "DELETE FROM mood_history WHERE id NOT IN ("
+                "SELECT id FROM mood_history ORDER BY id DESC LIMIT ?)",
+                (MOOD_HISTORY_KEEP,))
+        return old, new
+
+    def bump_moods(self, deltas, trigger=""):
+        cur = self.get_moods()
+        out = {}
+        for axis, d in deltas.items():
+            if axis not in MOOD_DEFAULTS:
+                continue
+            old, new = self.set_mood(axis, cur.get(axis, 0.5) + d, trigger)
+            out[axis] = (old, new)
+        return out
+
+    def mood_summary(self):
+        m = self.get_moods()
+        if not m:
+            return "neutral", {}
+        dom = max(m, key=m.get)
+        return dom, m
+
+    def add_milestone(self, label, detail="", importance=0.5):
+        with self.lock, self._conn() as db:
+            cur = db.execute(
+                "INSERT INTO milestones(label,detail,importance,created_at)"
+                " VALUES(?,?,?,?)",
+                (label, detail, importance, stamp()))
+            return cur.lastrowid
+
+    def recent_milestones(self, limit=5):
+        with self.lock, self._conn() as db:
+            rows = db.execute(
+                "SELECT * FROM milestones ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_milestones(self, keyword, limit=5):
+        like = f"%{keyword}%"
+        with self.lock, self._conn() as db:
+            rows = db.execute(
+                "SELECT * FROM milestones WHERE label LIKE ? OR detail LIKE ?"
+                " ORDER BY id DESC LIMIT ?",
+                (like, like, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_prefetch(self, command, suggestion):
+        with self.lock, self._conn() as db:
+            db.execute(
+                "INSERT INTO prefetch(command,suggestion,created_at) "
+                "VALUES(?,?,?)", (command, suggestion, stamp()))
+
+    def get_prefetch(self, command):
+        with self.lock, self._conn() as db:
+            row = db.execute(
+                "SELECT suggestion FROM prefetch WHERE command=? "
+                "ORDER BY id DESC LIMIT 1", (command,)).fetchone()
+        return row["suggestion"] if row else None
+
+
+# =========================================================
+# 3. SAFE EXECUTOR
+# =========================================================
+class SafeExecutor:
+    ALLOWLIST = {
+        "nmap", "masscan", "rustscan", "whois", "dig", "nslookup",
+        "curl", "wget", "git", "python3", "bash", "ls", "pwd", "cat",
+        "head", "tail", "grep", "find", "which", "echo", "uname",
+        "ifconfig", "ip", "ss", "netstat", "ping", "traceroute",
+        "nikto", "gobuster", "ffuf", "dirb", "whatweb", "nuclei",
+        "sqlmap", "hydra", "john", "hashcat", "strings", "file",
+        "exiftool", "binwalk", "strace", "ps", "df", "du", "free",
+        "ufw", "iptables", "journalctl", "lastb", "last", "who",
+    }
+    DENY = [
+        r"rm\s+-rf\s+/", r"mkfs", r"dd\s+if=.*of=/dev/",
+        r":\(\)\s*\{.*\};:", r"chmod\s+777\s+/",
+        r">\s*/dev/sd", r"shutdown", r"reboot", r"init\s+0",
+        r"\|\s*bash", r"\|\s*sh\b", r"curl.*\|\s*sh",
+        r"wget.*\|\s*sh", r"eval\s*\(", r"exec\s*\(",
+    ]
+
+    def __init__(self, db):
+        self.db = db
+
+    def validate(self, command):
+        if not command or len(command) > 4000:
+            return False, "empty/too_long"
+        for pat in self.DENY:
+            if re.search(pat, command.lower()):
+                return False, f"blocked_pattern: {pat}"
+        if re.search(r"[;&|`$><]", command):
+            return False, "shell_metacharacter"
+        try:
+            parts = shlex.split(command)
+        except ValueError as e:
+            return False, f"parse: {e}"
+        if not parts:
+            return False, "empty"
+        if os.path.basename(parts[0]) not in self.ALLOWLIST:
+            return False, f"not_allowed: {parts[0]}"
+        return True, parts
+
+    def execute(self, command, auto=False, retry_of=None):
+        ok, res = self.validate(command)
+        if not ok:
+            self.db.audit("DENY", f"{command} :: {res}")
+            self.db.log_command(command, -1, f"[BLOCKED] {res}", retry_of)
+            return {"exit_code": -1, "output": f"[BLOCKED] {res}"}
+        self.db.audit("EXEC_AUTO" if auto else "EXEC", command)
+        try:
+            p = subprocess.run(
+                res, cwd=str(ROOT), capture_output=True,
+                text=True, timeout=COMMAND_TIMEOUT, shell=False)
+            out = ""
+            if p.stdout.strip():
+                out += f"[STDOUT]\n{p.stdout.strip()}\n"
+            if p.stderr.strip():
+                out += f"[STDERR]\n{p.stderr.strip()}\n"
+            if not out:
+                out = "[No output]"
+            if len(out) > 12000:
+                out = out[:12000] + "\n...[TRUNCATED]..."
+            self.db.log_command(command, p.returncode, out, retry_of)
+            return {"exit_code": p.returncode, "output": out}
+        except subprocess.TimeoutExpired:
+            self.db.log_command(
+                command, -1, f"[TIMEOUT] {COMMAND_TIMEOUT}s", retry_of)
+            return {"exit_code": -1,
+                    "output": f"[TIMEOUT] {COMMAND_TIMEOUT}s"}
+        except Exception as e:
+            self.db.log_command(
+                command, -1, f"[ERROR] {safe_error(e)}", retry_of)
+            return {"exit_code": -1, "output": f"[ERROR] {safe_error(e)}"}
+
+
+# =========================================================
+# 4. INTRUSION DEFENDER
+# =========================================================
+class IntrusionDefender:
+    FAIL_PATTERNS = [
+        re.compile(r"Failed password for .* from (?P<ip>\d+\.\d+\.\d+\.\d+)"),
+        re.compile(r"Invalid user .* from (?P<ip>\d+\.\d+\.\d+\.\d+)"),
+        re.compile(
+            r"authentication failure;.*rhost=(?P<ip>\d+\.\d+\.\d+\.\d+)"),
+        re.compile(r"client: (?P<ip>\d+\.\d+\.\d+\.\d+)"),
+    ]
+
+    def __init__(self, db, executor):
+        self.db = db
+        self.executor = executor
+        self.fail_window = defaultdict(deque)
+        self.alert_queue = deque(maxlen=100)
+        self._stop = threading.Event()
+
+    def start(self):
+        if not DEFENDER_ENABLED:
+            log.info("Defender disabled")
+            return
+        threading.Thread(
+            target=self._loop, name="ria-defender", daemon=True).start()
+        log.info("Defender started; auth log=%s", AUTH_LOG)
+
+    def drain_alerts(self):
+        out = []
+        while True:
+            try:
+                out.append(self.alert_queue.popleft())
+            except IndexError:
+                break
+        return out
+
+    def _loop(self):
+        path = Path(AUTH_LOG)
+        pos = path.stat().st_size if path.exists() else 0
+        while not self._stop.is_set():
+            try:
+                if path.exists():
+                    size = path.stat().st_size
+                    if size < pos:
+                        pos = 0
+                    if size > pos:
+                        with path.open("r", errors="replace") as f:
+                            f.seek(pos)
+                            for line in f:
+                                self._inspect(line)
+                            pos = f.tell()
+                self._decay()
+            except Exception as e:
+                log.warning("defender loop error: %s", safe_error(e))
+            self._stop.wait(DEFENDER_SCAN_INTERVAL)
+
+    def _inspect(self, line):
+        for pat in self.FAIL_PATTERNS:
+            m = pat.search(line)
+            if not m:
+                continue
+            ip = m.group("ip")
+            if ip in DEFENDER_WHITELIST:
+                return
+            now = time.time()
+            dq = self.fail_window[ip]
+            dq.append(now)
+            if len(dq) >= DEFENDER_FAIL_THRESHOLD:
+                self._block(ip, reason="repeated_auth_failure",
+                            detail=line.strip()[:500])
+                dq.clear()
+            return
+
+    def _decay(self):
+        cutoff = time.time() - DEFENDER_WINDOW_SEC
+        for ip in list(self.fail_window.keys()):
+            dq = self.fail_window[ip]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                del self.fail_window[ip]
+
+  
